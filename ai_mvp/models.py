@@ -1,0 +1,234 @@
+"""Optional local Ollama and explicitly enabled remote chat generation."""
+
+import json
+import os
+import re
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
+from urllib.parse import urlsplit
+
+
+_DEFAULT_URL = "http://127.0.0.1:11434"
+_DEFAULT_TIMEOUT = 90.0
+_REMOTE_TIMEOUT = 30.0
+_DEFAULT_REMOTE_URL = "https://api.openai.com/v1"
+_DEFAULT_REMOTE_MODEL = "gpt-6-luna"
+_CHAT_COMPLETIONS = "/v1/chat/completions"
+_MAX_RESPONSE_BYTES = 1_000_000
+_CLOUD_MODEL = re.compile(r"(?:-|:)cloud(?::[^/]*)?$", re.IGNORECASE)
+
+
+class ModelUnavailable(RuntimeError):
+    """The caller can use its offline response path."""
+
+
+def _with_default_tag(name: str) -> str:
+    if ":" in name.rsplit("/", 1)[-1]:
+        return name
+    return f"{name}:latest"
+
+
+def _request_json(
+    connection: HTTPConnection,
+    source: str,
+    method: str,
+    path: str,
+    data: dict | None = None,
+    api_key: str | None = None,
+) -> dict:
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    if api_key is not None:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ModelUnavailable(f"{source} returned HTTP {response.status}")
+        raw = response.read(_MAX_RESPONSE_BYTES + 1)
+    except (OSError, HTTPException, ValueError):
+        raise ModelUnavailable(f"Cannot read from {source}") from None
+    finally:
+        connection.close()
+
+    if len(raw) > _MAX_RESPONSE_BYTES:
+        raise ModelUnavailable(f"{source} response exceeds the size limit")
+    try:
+        result = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise ModelUnavailable(f"{source} returned invalid JSON") from None
+    if not isinstance(result, dict):
+        raise ModelUnavailable(f"{source} returned an invalid response")
+    return result
+
+
+def _messages(system: str, user: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+class OllamaModel:
+    def __init__(self, model: str, url: str = _DEFAULT_URL, timeout: float = _DEFAULT_TIMEOUT):
+        endpoint = urlsplit(url)
+        if (
+            endpoint.scheme != "http"
+            or endpoint.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or endpoint.username is not None
+            or endpoint.path not in {"", "/"}
+            or endpoint.query
+            or endpoint.fragment
+        ):
+            raise ValueError("AI_MVP_OLLAMA_URL must be an HTTP loopback origin")
+        self.host = "::1" if endpoint.hostname == "::1" else "127.0.0.1"
+        port = endpoint.port
+        if port == 0:
+            raise ValueError("AI_MVP_OLLAMA_URL must use a nonzero port")
+        self.port = port if port is not None else 11434
+        if not model or any(char.isspace() for char in model) or _CLOUD_MODEL.search(model):
+            raise ValueError("AI_MVP_OLLAMA_MODEL must name an installed local model")
+        self.model = _with_default_tag(model)
+        if not 1 <= timeout <= 300:
+            raise ValueError("AI_MVP_OLLAMA_TIMEOUT_SECONDS must be between 1 and 300")
+        self.timeout = timeout
+
+    def _request(self, method: str, path: str, data: dict | None = None) -> dict:
+        # A direct loopback connection ignores proxy settings and never follows redirects.
+        connection = HTTPConnection(self.host, self.port, timeout=self.timeout)
+        return _request_json(connection, "local Ollama", method, path, data)
+
+    def generate(self, system: str, user: str) -> str:
+        # An installed alias can still point to a remote model. Check its metadata
+        # before sending any user data to the model endpoint.
+        tags = self._request("GET", "/api/tags").get("models")
+        accepted_names = (self.model, self.model.removesuffix(":latest"))
+        if not isinstance(tags, list) or not any(
+            isinstance(entry, dict)
+            and (entry.get("model") or entry.get("name")) in accepted_names
+            and not entry.get("remote_host")
+            and not entry.get("remote_model")
+            for entry in tags
+        ):
+            raise ModelUnavailable("The configured model is not installed locally")
+
+        result = self._request(
+            "POST",
+            "/api/chat",
+            {
+                "model": self.model,
+                "messages": _messages(system, user),
+                "stream": False,
+                "think": False,
+                "options": {"temperature": 0.2, "num_predict": 320},
+            },
+        )
+        message = result.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            content = content.rsplit("</think>", 1)[-1].strip()
+        if not isinstance(content, str) or not content or "<think>" in content:
+            raise ModelUnavailable("The local model returned no final answer")
+        if result.get("done") is not True or result.get("done_reason") == "length":
+            raise ModelUnavailable("The local model did not finish its reply")
+        return content
+
+
+class OpenAICompatibleModel:
+    def __init__(self, model: str, url: str, api_key: str, timeout: float = _REMOTE_TIMEOUT):
+        invalid_url = "AI_MVP_REMOTE_BASE_URL must be an HTTPS origin with an optional /v1 path"
+        try:
+            endpoint = urlsplit(url)
+            port = endpoint.port
+        except ValueError:
+            raise ValueError(invalid_url) from None
+        if (
+            endpoint.scheme != "https"
+            or not endpoint.hostname
+            or port == 0
+            or endpoint.username is not None
+            or endpoint.path not in {"", "/", "/v1", "/v1/"}
+            or any(char in url for char in "?#\\")
+            or any(char.isspace() or not char.isprintable() for char in url)
+        ):
+            raise ValueError(invalid_url)
+        if not model or any(char.isspace() for char in model):
+            raise ValueError("AI_MVP_REMOTE_MODEL must name a model")
+        if not api_key or any(not 33 <= ord(char) <= 126 for char in api_key):
+            raise ValueError("AI_MVP_REMOTE_API_KEY must be a nonempty API key")
+        if not 1 <= timeout <= 120:
+            raise ValueError("AI_MVP_REMOTE_TIMEOUT_SECONDS must be between 1 and 120")
+        self.host = endpoint.hostname
+        self.port = port if port is not None else 443
+        self.model = model
+        self.timeout = timeout
+        self._api_key = api_key
+
+    def generate(self, system: str, user: str) -> str:
+        # HTTPSConnection verifies TLS and sends only one request to the configured host.
+        connection = HTTPSConnection(self.host, self.port, timeout=self.timeout)
+        payload = {
+            "model": self.model,
+            "messages": _messages(system, user),
+            "stream": False,
+        }
+        if self.host == "api.openai.com" and self.port == 443:
+            payload["max_completion_tokens"] = 320
+            if self.model == _DEFAULT_REMOTE_MODEL:
+                payload["reasoning_effort"] = "none"
+        else:
+            payload["max_tokens"] = 320
+        result = _request_json(
+            connection,
+            "remote model provider",
+            "POST",
+            _CHAT_COMPLETIONS,
+            payload,
+            self._api_key,
+        )
+        choices = result.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ModelUnavailable("The remote model returned no final answer")
+        choice = choices[0]
+        message = choice.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if (
+            choice.get("finish_reason") not in (None, "stop")
+            or not isinstance(content, str)
+            or not content.strip()
+            or self._api_key in content
+        ):
+            raise ModelUnavailable("The remote model returned no final answer")
+        return content.strip()
+
+
+def _timeout_from_environment(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        raise ValueError(f"{name} must be a number") from None
+
+
+def from_environment(*, model_name: str | None = None) -> OllamaModel | None:
+    model = (model_name if model_name is not None else os.environ.get("AI_MVP_OLLAMA_MODEL", "")).strip()
+    if not model:
+        return None
+    timeout = _timeout_from_environment("AI_MVP_OLLAMA_TIMEOUT_SECONDS", _DEFAULT_TIMEOUT)
+    return OllamaModel(model, os.environ.get("AI_MVP_OLLAMA_URL", _DEFAULT_URL).strip(), timeout)
+
+
+def remote_from_environment(*, enabled: bool = False) -> OpenAICompatibleModel | None:
+    if not enabled and os.environ.get("AI_MVP_REMOTE_ENABLED") != "1":
+        return None
+    base_url = os.environ.get("AI_MVP_REMOTE_BASE_URL", _DEFAULT_REMOTE_URL).strip()
+    default_model = _DEFAULT_REMOTE_MODEL if base_url.rstrip("/") in {
+        "https://api.openai.com", _DEFAULT_REMOTE_URL,
+    } else ""
+    return OpenAICompatibleModel(
+        os.environ.get("AI_MVP_REMOTE_MODEL", default_model).strip(),
+        base_url,
+        os.environ.get("AI_MVP_REMOTE_API_KEY", ""),
+        _timeout_from_environment("AI_MVP_REMOTE_TIMEOUT_SECONDS", _REMOTE_TIMEOUT),
+    )
