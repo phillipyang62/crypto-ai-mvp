@@ -70,26 +70,30 @@ class OllamaModelTests(unittest.TestCase):
 
 class RemoteModelTests(unittest.TestCase):
     def test_key_alone_cannot_enable_remote_requests(self):
-        with patch.dict(os.environ, {"AI_MVP_REMOTE_API_KEY": "fake-api-key"}, clear=True):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fake-deepseek-key"}, clear=True):
             self.assertIsNone(remote_from_environment())
-        with patch.dict(os.environ, {"AI_MVP_REMOTE_ENABLED": "1"}, clear=True):
-            with self.assertRaisesRegex(ValueError, "AI_MVP_REMOTE_API_KEY"):
+        with patch.dict(os.environ, {
+            "AI_MVP_REMOTE_ENABLED": "1", "AI_MVP_REMOTE_API_KEY": "previous-provider-key",
+        }, clear=True):
+            with self.assertRaisesRegex(ValueError, "DEEPSEEK_API_KEY"):
                 remote_from_environment()
 
-    def test_key_and_cli_opt_in_use_current_openai_defaults_without_connecting(self):
+    def test_key_and_cli_opt_in_use_deepseek_defaults_without_connecting_at_startup(self):
         reply = connection_returning({"choices": [{
             "message": {"content": "按画像回答。"}, "finish_reason": "stop"
         }]})
-        with patch.dict(os.environ, {"AI_MVP_REMOTE_API_KEY": "fake-api-key"}, clear=True):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "fake-deepseek-key"}, clear=True):
             with patch("ai_mvp.models.HTTPSConnection", return_value=reply) as connect:
                 model = remote_from_environment(enabled=True)
-                self.assertEqual((model.host, model.model), ("api.openai.com", "gpt-6-luna"))
+                self.assertEqual((model.host, model.model), ("api.deepseek.com", "deepseek-flash"))
                 connect.assert_not_called()
                 self.assertEqual(model.generate("画像", "问题"), "按画像回答。")
         body = json.loads(reply.request.call_args.kwargs["body"])
-        self.assertEqual(body["max_completion_tokens"], 320)
-        self.assertEqual(body["reasoning_effort"], "none")
-        self.assertNotIn("max_tokens", body)
+        connect.assert_called_once_with("api.deepseek.com", 443, timeout=30.0)
+        self.assertEqual(reply.request.call_args.args, ("POST", "/v1/chat/completions"))
+        self.assertEqual(reply.request.call_args.kwargs["headers"]["Authorization"], "Bearer fake-deepseek-key")
+        self.assertEqual(body["max_tokens"], 320)
+        self.assertEqual(body["thinking"], {"type": "disabled"})
 
     def test_custom_provider_requires_an_explicit_model(self):
         with patch.dict(os.environ, {
@@ -104,16 +108,16 @@ class RemoteModelTests(unittest.TestCase):
         reply = connection_returning({"choices": [{"message": {"content": "回答"}, "finish_reason": "stop"}]})
         with patch.dict(os.environ, {
             "AI_MVP_REMOTE_ENABLED": "1",
-            "AI_MVP_REMOTE_API_KEY": "fake-api-key",
-            "AI_MVP_REMOTE_MODEL": "gpt-4.1-mini",
+            "DEEPSEEK_API_KEY": "fake-deepseek-key",
+            "AI_MVP_REMOTE_MODEL": "deepseek-v4-pro",
         }, clear=True):
             with patch("ai_mvp.models.HTTPSConnection", return_value=reply):
                 model = remote_from_environment()
-                self.assertEqual(model.model, "gpt-4.1-mini")
+                self.assertEqual(model.model, "deepseek-v4-pro")
                 model.generate("画像", "问题")
         body = json.loads(reply.request.call_args.kwargs["body"])
-        self.assertEqual(body["max_completion_tokens"], 320)
-        self.assertNotIn("reasoning_effort", body)
+        self.assertEqual(body["max_tokens"], 320)
+        self.assertEqual(body["thinking"], {"type": "disabled"})
 
     def test_remote_url_must_be_https_and_must_not_embed_credentials(self):
         for url in ("http://provider.example", "https://private-token@provider.example"):

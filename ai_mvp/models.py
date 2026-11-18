@@ -10,8 +10,9 @@ from urllib.parse import urlsplit
 _DEFAULT_URL = "http://127.0.0.1:11434"
 _DEFAULT_TIMEOUT = 90.0
 _REMOTE_TIMEOUT = 30.0
-_DEFAULT_REMOTE_URL = "https://api.openai.com/v1"
-_DEFAULT_REMOTE_MODEL = "gpt-6-luna"
+_DEEPSEEK_HOST = "api.deepseek.com"
+_DEFAULT_REMOTE_URL = f"https://{_DEEPSEEK_HOST}/v1"
+_DEFAULT_REMOTE_MODEL = "deepseek-flash"
 _CHAT_COMPLETIONS = "/v1/chat/completions"
 _MAX_RESPONSE_BYTES = 1_000_000
 _CLOUD_MODEL = re.compile(r"(?:-|:)cloud(?::[^/]*)?$", re.IGNORECASE)
@@ -157,7 +158,7 @@ class OpenAICompatibleModel:
         if not model or any(char.isspace() for char in model):
             raise ValueError("AI_MVP_REMOTE_MODEL must name a model")
         if not api_key or any(not 33 <= ord(char) <= 126 for char in api_key):
-            raise ValueError("AI_MVP_REMOTE_API_KEY must be a nonempty API key")
+            raise ValueError("The remote API key must contain printable ASCII characters without spaces")
         if not 1 <= timeout <= 120:
             raise ValueError("AI_MVP_REMOTE_TIMEOUT_SECONDS must be between 1 and 120")
         self.host = endpoint.hostname
@@ -173,13 +174,10 @@ class OpenAICompatibleModel:
             "model": self.model,
             "messages": _messages(system, user),
             "stream": False,
+            "max_tokens": 320,
         }
-        if self.host == "api.openai.com" and self.port == 443:
-            payload["max_completion_tokens"] = 320
-            if self.model == _DEFAULT_REMOTE_MODEL:
-                payload["reasoning_effort"] = "none"
-        else:
-            payload["max_tokens"] = 320
+        if self.host == _DEEPSEEK_HOST and self.port == 443:
+            payload["thinking"] = {"type": "disabled"}
         result = _request_json(
             connection,
             "remote model provider",
@@ -223,12 +221,20 @@ def remote_from_environment(*, enabled: bool = False) -> OpenAICompatibleModel |
     if not enabled and os.environ.get("AI_MVP_REMOTE_ENABLED") != "1":
         return None
     base_url = os.environ.get("AI_MVP_REMOTE_BASE_URL", _DEFAULT_REMOTE_URL).strip()
-    default_model = _DEFAULT_REMOTE_MODEL if base_url.rstrip("/") in {
-        "https://api.openai.com", _DEFAULT_REMOTE_URL,
-    } else ""
+    deepseek = base_url.rstrip("/").lower() in {
+        f"https://{_DEEPSEEK_HOST}", _DEFAULT_REMOTE_URL,
+        f"https://{_DEEPSEEK_HOST}:443", f"https://{_DEEPSEEK_HOST}:443/v1",
+    }
+    model = os.environ.get("AI_MVP_REMOTE_MODEL", _DEFAULT_REMOTE_MODEL if deepseek else "").strip()
+    if not model:
+        raise ValueError("AI_MVP_REMOTE_MODEL must name a model")
+    key_name = "DEEPSEEK_API_KEY" if deepseek else "AI_MVP_REMOTE_API_KEY"
+    api_key = os.environ.get(key_name, "")
+    if not api_key:
+        raise ValueError(f"{key_name} must be a nonempty API key")
     return OpenAICompatibleModel(
-        os.environ.get("AI_MVP_REMOTE_MODEL", default_model).strip(),
+        model,
         base_url,
-        os.environ.get("AI_MVP_REMOTE_API_KEY", ""),
+        api_key,
         _timeout_from_environment("AI_MVP_REMOTE_TIMEOUT_SECONDS", _REMOTE_TIMEOUT),
     )
